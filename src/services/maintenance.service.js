@@ -186,6 +186,12 @@ const getMaintenanceOrders = async (query = {}) => {
     priority,
   } = query;
 
+  try {
+    await checkOverdueOrders();
+  } catch (checkErr) {
+    console.error('查询工单前自动检查超时失败:', checkErr.message);
+  }
+
   const filter = {};
   if (vehicleId) filter.vehicle = vehicleId;
   if (technicianId) filter.assignedTechnician = technicianId;
@@ -240,7 +246,7 @@ const startMaintenance = async (orderId, technicianId) => {
     throw new AppError('工单不存在', 404);
   }
 
-  if (order.status !== 'assigned' && order.status !== 'pending') {
+  if (!['assigned', 'pending', 'escalated'].includes(order.status)) {
     throw new AppError('该工单状态不允许开始', 400);
   }
 
@@ -282,7 +288,7 @@ const completeMaintenance = async (orderId, completionData = {}) => {
 
     const pendingOrders = await MaintenanceOrder.countDocuments({
       vehicle: vehicle._id,
-      status: { $in: ['pending', 'assigned', 'in_progress'] },
+      status: { $in: ['pending', 'assigned', 'in_progress', 'escalated'] },
       _id: { $ne: orderId },
     });
 
@@ -324,8 +330,8 @@ const checkOverdueOrders = async () => {
     isOverdue: false,
   }).populate('vehicle');
 
-  const alreadyOverdueButNotEscalated = await MaintenanceOrder.find({
-    status: { $in: ['pending', 'assigned', 'in_progress'] },
+  const alreadyOverdue = await MaintenanceOrder.find({
+    status: { $in: ['pending', 'assigned', 'in_progress', 'escalated'] },
     isOverdue: true,
   }).populate('vehicle');
 
@@ -333,15 +339,12 @@ const checkOverdueOrders = async () => {
 
   for (const order of justOverdue) {
     order.isOverdue = true;
-    order.overdueHours = Math.max(1, Math.abs(diffHours(now, order.deadline)));
-
-    if (order.overdueHours >= ESCALATION_HOURS) {
-      order.status = 'escalated';
-      order.priority = order.priority === 'low' ? 'medium'
-        : order.priority === 'medium' ? 'high'
-        : 'urgent';
-      order.notes = `系统自动升级：工单已超时 ${order.overdueHours.toFixed(0)} 小时${order.notes ? '；' + order.notes : ''}`;
-    }
+    order.overdueHours = Math.max(0.1, Math.abs(diffHours(now, order.deadline)));
+    order.status = 'escalated';
+    order.priority = order.priority === 'low' ? 'medium'
+      : order.priority === 'medium' ? 'high'
+      : 'urgent';
+    order.notes = `系统自动升级：工单已超时 ${order.overdueHours.toFixed(1)} 小时${order.notes ? '；' + order.notes : ''}`;
 
     await order.save();
     processedCount++;
@@ -350,8 +353,8 @@ const checkOverdueOrders = async () => {
       await notifyAdmin(
         'system_admin',
         'maintenance_escalated',
-        `工单已超时${order.status === 'escalated' ? '并自动升级' : ''}`,
-        `工单 ${order._id}（${order.vehicle.plateNumber}）已超时 ${order.overdueHours.toFixed(0)} 小时${order.status === 'escalated' ? `，优先级已自动升级为 ${getPriorityName(order.priority)}` : ''}，请尽快处理。`,
+        '工单已超时并自动升级',
+        `工单 ${order._id}（${order.vehicle.plateNumber}）已超时 ${order.overdueHours.toFixed(1)} 小时，状态已自动升级为待跟进，优先级升级为 ${getPriorityName(order.priority)}，请尽快处理。`,
         order._id,
         'MaintenanceOrder'
       );
@@ -360,32 +363,37 @@ const checkOverdueOrders = async () => {
     }
   }
 
-  for (const order of alreadyOverdueButNotEscalated) {
-    const currentOverdueHours = Math.max(1, Math.abs(diffHours(now, order.deadline)));
+  for (const order of alreadyOverdue) {
+    const currentOverdueHours = Math.max(0.1, Math.abs(diffHours(now, order.deadline)));
+    const previousOverdueHours = order.overdueHours || 0;
     order.overdueHours = currentOverdueHours;
 
     let needUpgrade = false;
     let newPriority = order.priority;
-    let newStatus = order.status;
+    const upgradeThresholds = [
+      { hours: 4, from: 'low', to: 'medium' },
+      { hours: 8, from: 'medium', to: 'high' },
+      { hours: 12, from: 'high', to: 'urgent' },
+    ];
 
-    if (currentOverdueHours >= ESCALATION_HOURS * 3 && order.priority !== 'urgent') {
-      newPriority = 'urgent';
-      needUpgrade = true;
-    } else if (currentOverdueHours >= ESCALATION_HOURS * 2 && order.priority === 'low') {
-      newPriority = 'high';
-      needUpgrade = true;
-    } else if (currentOverdueHours >= ESCALATION_HOURS && order.status !== 'escalated') {
-      newStatus = 'escalated';
-      newPriority = order.priority === 'low' ? 'medium'
-        : order.priority === 'medium' ? 'high'
-        : 'urgent';
+    for (const threshold of upgradeThresholds) {
+      if (currentOverdueHours >= threshold.hours &&
+          previousOverdueHours < threshold.hours &&
+          order.priority === threshold.from) {
+        newPriority = threshold.to;
+        needUpgrade = true;
+        break;
+      }
+    }
+
+    if (order.status !== 'escalated') {
+      order.status = 'escalated';
       needUpgrade = true;
     }
 
     if (needUpgrade) {
       order.priority = newPriority;
-      order.status = newStatus;
-      order.notes = `系统自动升级（超时 ${currentOverdueHours.toFixed(0)} 小时）${order.notes ? '；' + order.notes : ''}`;
+      order.notes = `系统自动升级（超时 ${currentOverdueHours.toFixed(1)} 小时）${order.notes ? '；' + order.notes : ''}`;
       await order.save();
       processedCount++;
 
@@ -393,8 +401,8 @@ const checkOverdueOrders = async () => {
         await notifyAdmin(
           'system_admin',
           'maintenance_escalated',
-          '工单再次升级',
-          `工单 ${order._id}（${order.vehicle.plateNumber}）已超时 ${currentOverdueHours.toFixed(0)} 小时，已再次升级为 ${getPriorityName(order.priority)} 优先级，状态：${order.status}。`,
+          '工单优先级升级',
+          `工单 ${order._id}（${order.vehicle.plateNumber}）已超时 ${currentOverdueHours.toFixed(1)} 小时，优先级已升级为 ${getPriorityName(order.priority)}，请尽快处理。`,
           order._id,
           'MaintenanceOrder'
         );

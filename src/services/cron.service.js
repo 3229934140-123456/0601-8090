@@ -18,7 +18,7 @@ const startCronJobs = () => {
     }
   });
 
-  cron.schedule('0 */6 * * *', async () => {
+  cron.schedule('0 * * * *', async () => {
     console.log('执行超时工单检查...');
     try {
       const overdueCount = await maintenanceService.checkOverdueOrders();
@@ -63,7 +63,7 @@ const startCronJobs = () => {
 
   console.log('已注册定时任务：');
   console.log('  - 每日 01:00 保养工单检查');
-  console.log('  - 每 6 小时 超时工单检查');
+  console.log('  - 每 1 小时 超时工单检查');
   console.log('  - 每日 02:00 身份证过期检查');
   console.log('  - 每日 08:00 生成运营报表');
 };

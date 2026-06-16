@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const Student = require('../models/Student');
 const ExamBooking = require('../models/ExamBooking');
 const Vehicle = require('../models/Vehicle');
@@ -6,6 +7,23 @@ const ExamRoom = require('../models/ExamRoom');
 const DrivingLicense = require('../models/DrivingLicense');
 const ExcelJS = require('exceljs');
 const { formatDate, getDatesBetween } = require('../utils/dateUtils');
+
+const getExamRoomRelatedStudentIds = async (examRoomId, startDate, endDate) => {
+  if (!examRoomId) return null;
+
+  const bookings = await ExamBooking.aggregate([
+    {
+      $match: {
+        examRoom: new mongoose.Types.ObjectId(examRoomId),
+        examDate: { $gte: startDate, $lte: endDate },
+        student: { $exists: true, $ne: null },
+      },
+    },
+    { $group: { _id: '$student' } },
+  ]);
+
+  return bookings.map((b) => b._id);
+};
 
 const generateDailyReport = async (date = new Date(), examRoomId = null) => {
   const startOfDay = new Date(date);
@@ -18,18 +36,24 @@ const generateDailyReport = async (date = new Date(), examRoomId = null) => {
   const examRoom = examRoomId ? await ExamRoom.findById(examRoomId) : null;
   const examRoomName = examRoom ? examRoom.name : '全部场地';
 
+  const relatedStudentIds = await getExamRoomRelatedStudentIds(examRoomId, startOfDay, endOfDay);
+  const studentFilter = relatedStudentIds ? { _id: { $in: relatedStudentIds } } : {};
+
   const enrollmentCount = await Student.countDocuments({
     createdAt: { $gte: startOfDay, $lte: endOfDay },
+    ...studentFilter,
   });
 
   const approvedCount = await Student.countDocuments({
     status: 'approved',
     updatedAt: { $gte: startOfDay, $lte: endOfDay },
+    ...studentFilter,
   });
 
   const rejectedCount = await Student.countDocuments({
     status: 'rejected',
     updatedAt: { $gte: startOfDay, $lte: endOfDay },
+    ...studentFilter,
   });
 
   const examQuery = {
@@ -224,7 +248,7 @@ const generateDateRangeReport = async (startDate, endDate, examRoomId = null) =>
   };
 
   const examTypeStats = await getExamTypeStats(start, end, examRoomId);
-  const licenseTypeStats = await getLicenseTypeStats(start, end);
+  const licenseTypeStats = await getLicenseTypeStats(start, end, examRoomId);
 
   return {
     summary,
@@ -243,7 +267,6 @@ const getExamTypeStats = async (startDate, endDate, examRoomId = null) => {
     matchCondition.examRoom = new mongoose.Types.ObjectId(examRoomId);
   }
 
-  const mongoose = require('mongoose');
   const stats = await ExamBooking.aggregate([
     { $match: matchCondition },
     {
@@ -283,11 +306,15 @@ const getExamTypeName = (type) => {
   return names[type] || type;
 };
 
-const getLicenseTypeStats = async (startDate, endDate) => {
+const getLicenseTypeStats = async (startDate, endDate, examRoomId = null) => {
+  const relatedStudentIds = await getExamRoomRelatedStudentIds(examRoomId, startDate, endDate);
+  const studentFilter = relatedStudentIds ? { _id: { $in: relatedStudentIds } } : {};
+
   const stats = await Student.aggregate([
     {
       $match: {
         createdAt: { $gte: startDate, $lte: endDate },
+        ...studentFilter,
       },
     },
     {
@@ -431,11 +458,15 @@ const exportReportToExcel = async (startDate, endDate, type = 'all', examRoomId 
   if (type === 'enrollment' || type === 'all') {
     const enrollmentSheet = workbook.addWorksheet('报名明细');
 
+    const relatedStudentIds = await getExamRoomRelatedStudentIds(examRoomId, new Date(startDate), new Date(endDate));
+    const studentFilter = relatedStudentIds ? { _id: { $in: relatedStudentIds } } : {};
+
     const studentQuery = {
       createdAt: {
         $gte: new Date(startDate),
         $lte: new Date(endDate),
       },
+      ...studentFilter,
     };
 
     const students = await Student.find(studentQuery)
@@ -475,7 +506,6 @@ const exportReportToExcel = async (startDate, endDate, type = 'all', examRoomId 
   if (type === 'examDetail' || type === 'all') {
     const examDetailSheet = workbook.addWorksheet('考试明细');
 
-    const mongoose = require('mongoose');
     const examDetailQuery = {
       examDate: {
         $gte: new Date(startDate),
