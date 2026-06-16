@@ -136,27 +136,57 @@ const findAvailableCoaches = async (licenseType, date, timeSlot) => {
   return availableCoaches;
 };
 
+const isVehicleAvailableAtSlot = async (vehicleId, date, timeSlot) => {
+  const startOfDay = new Date(date);
+  startOfDay.setHours(0, 0, 0, 0);
+  const endOfDay = new Date(date);
+  endOfDay.setHours(23, 59, 59, 999);
+
+  const bookings = await ExamBooking.find({
+    vehicle: vehicleId,
+    examDate: { $gte: startOfDay, $lte: endOfDay },
+    status: { $in: ['pending', 'confirmed', 'locked'] },
+  });
+
+  for (const booking of bookings) {
+    if (
+      timeOverlap(
+        timeSlot.startTime,
+        timeSlot.endTime,
+        booking.timeSlot.startTime,
+        booking.timeSlot.endTime
+      )
+    ) {
+      return { available: false, conflictBooking: booking };
+    }
+  }
+
+  const schedules = await Schedule.find({
+    vehicle: vehicleId,
+    date: { $gte: startOfDay, $lte: endOfDay },
+    status: { $in: ['scheduled', 'in_progress'] },
+  });
+
+  for (const schedule of schedules) {
+    if (timeOverlap(timeSlot.startTime, timeSlot.endTime, schedule.startTime, schedule.endTime)) {
+      return { available: false, conflictBooking: schedule };
+    }
+  }
+
+  return { available: true, conflictBooking: null };
+};
+
 const findAvailableVehicles = async (licenseType, date, timeSlot) => {
   const vehicles = await Vehicle.find({
-    status: 'available',
+    status: { $in: ['available', 'in_use'] },
     licenseType,
   });
 
   const availableVehicles = [];
 
   for (const vehicle of vehicles) {
-    const bookings = await ExamBooking.find({
-      vehicle: vehicle._id,
-      examDate: {
-        $gte: new Date(date).setHours(0, 0, 0, 0),
-        $lte: new Date(date).setHours(23, 59, 59, 999),
-      },
-      status: { $in: ['pending', 'confirmed', 'locked'] },
-      'timeSlot.startTime': timeSlot.startTime,
-      'timeSlot.endTime': timeSlot.endTime,
-    });
-
-    if (bookings.length === 0) {
+    const result = await isVehicleAvailableAtSlot(vehicle._id, date, timeSlot);
+    if (result.available) {
       availableVehicles.push(vehicle);
     }
   }
@@ -171,7 +201,7 @@ const suggestAlternativeSlots = async (examType, licenseType, preferredDate, day
     status: 'active',
   });
 
-  for (let i = 1; i <= days; i++) {
+  for (let i = 0; i <= days; i++) {
     const checkDate = addDays(preferredDate, i);
     const dayOfWeek = checkDate.getDay();
 
@@ -182,25 +212,114 @@ const suggestAlternativeSlots = async (examType, licenseType, preferredDate, day
         const capacity = await getExamRoomCapacity(room._id, checkDate, slot);
         if (capacity.available > 0) {
           const coaches = await findAvailableCoaches(licenseType, checkDate, slot);
-          const vehicles = await findAvailableVehicles(licenseType, checkDate, slot);
+          const needVehicle = examType === 'subject2' || examType === 'subject3';
+          let vehiclesOk = true;
+          if (needVehicle) {
+            const vehicles = await findAvailableVehicles(licenseType, checkDate, slot);
+            vehiclesOk = vehicles.length > 0;
+          }
 
-          if (coaches.length > 0 && (examType === 'subject1' || examType === 'subject4' || vehicles.length > 0)) {
+          if (coaches.length > 0 && vehiclesOk) {
             suggestions.push({
               date: checkDate,
+              dateStr: formatDate(checkDate),
               timeSlot: slot,
               examRoom: room._id,
               examRoomName: room.name,
               availableCoaches: coaches.length,
-              availableVehicles: vehicles.length,
               remainingCapacity: capacity.available,
             });
+
+            if (suggestions.length >= 10) {
+              return suggestions;
+            }
           }
         }
       }
     }
   }
 
-  return suggestions.slice(0, 10);
+  return suggestions;
+};
+
+const autoAllocateResources = async (examType, licenseType, examDate, preferredTimeSlot) => {
+  const examRooms = await ExamRoom.find({
+    examType,
+    status: 'active',
+  });
+
+  if (examRooms.length === 0) {
+    return {
+      allocated: false,
+      reason: `没有${getExamTypeName(examType)}可用的考场`,
+    };
+  }
+
+  const dayOfWeek = new Date(examDate).getDay();
+  const availableRooms = examRooms.filter((r) => r.workDays.includes(dayOfWeek));
+
+  if (availableRooms.length === 0) {
+    return {
+      allocated: false,
+      reason: `所选日期（星期${'日一二三四五六'[dayOfWeek]}）没有开放的${getExamTypeName(examType)}考场`,
+    };
+  }
+
+  const slotsToCheck = [];
+  if (preferredTimeSlot && preferredTimeSlot.startTime && preferredTimeSlot.endTime) {
+    slotsToCheck.push(preferredTimeSlot);
+  }
+
+  for (const room of availableRooms) {
+    for (const slot of room.timeSlots) {
+      const notInList = !slotsToCheck.some(
+        (s) => s.startTime === slot.startTime && s.endTime === slot.endTime
+      );
+      if (notInList) {
+        slotsToCheck.push(slot);
+      }
+    }
+  }
+
+  for (const room of availableRooms) {
+    for (const timeSlot of slotsToCheck) {
+      const slotExists = room.timeSlots.some(
+        (s) => s.startTime === timeSlot.startTime && s.endTime === timeSlot.endTime
+      );
+      if (!slotExists) continue;
+
+      const capacity = await getExamRoomCapacity(room._id, examDate, timeSlot);
+      if (capacity.available <= 0) continue;
+
+      const coaches = await findAvailableCoaches(licenseType, examDate, timeSlot);
+      if (coaches.length === 0) continue;
+
+      let vehicle = null;
+      const needVehicle = examType === 'subject2' || examType === 'subject3';
+      if (needVehicle) {
+        const vehicles = await findAvailableVehicles(licenseType, examDate, timeSlot);
+        if (vehicles.length === 0) continue;
+        vehicle = vehicles[0];
+      }
+
+      return {
+        allocated: true,
+        examRoom: room,
+        coach: coaches[0],
+        vehicle,
+        timeSlot,
+        capacity,
+      };
+    }
+  }
+
+  const suggestions = await suggestAlternativeSlots(examType, licenseType, examDate);
+
+  return {
+    allocated: false,
+    reason: '所选条件下没有足够的资源，请从建议时段中选择',
+    suggestions,
+  };
 };
 
 const bookExam = async (bookingData) => {
@@ -239,147 +358,208 @@ const bookExam = async (bookingData) => {
     throw new AppError('您已有该科目的待考预约，无法重复预约', 400);
   }
 
-  const examRoom = await ExamRoom.findById(examRoomId);
-  if (!examRoom || examRoom.status !== 'active') {
-    throw new AppError('考场不可用', 400);
-  }
+  const needVehicle = examType === 'subject2' || examType === 'subject3';
 
-  if (examRoom.examType !== examType) {
-    throw new AppError('该考场不支持此考试类型', 400);
-  }
+  let allocatedExamRoom = null;
+  let allocatedCoach = null;
+  let allocatedVehicle = null;
+  let allocatedTimeSlot = timeSlot;
 
-  const dayOfWeek = new Date(examDate).getDay();
-  if (!examRoom.workDays.includes(dayOfWeek)) {
-    throw new AppError('所选日期考场不开放', 400);
-  }
-
-  const capacity = await getExamRoomCapacity(examRoomId, examDate, timeSlot);
-  if (capacity.available <= 0) {
-    const suggestions = await suggestAlternativeSlots(
-      examType,
-      student.licenseType,
-      examDate
-    );
-    return {
-      success: false,
-      conflict: true,
-      reason: '所选时段考场已满',
-      suggestions,
-    };
-  }
-
-  const coach = await Coach.findById(coachId || student.assignedCoach);
-  if (!coach || coach.status !== 'active') {
-    throw new AppError('教练不可用', 400);
-  }
-
-  if (!coach.licenseTypes.includes(student.licenseType)) {
-    throw new AppError('该教练不支持此驾照类型教学', 400);
-  }
-
-  const coachBusySlots = await getCoachAvailability(coach._id, examDate);
-  const coachCheck = checkCoachAvailable(
-    coachBusySlots,
-    timeSlot.startTime,
-    timeSlot.endTime
-  );
-
-  if (!coachCheck.available) {
-    const suggestions = await suggestAlternativeSlots(
-      examType,
-      student.licenseType,
-      examDate
-    );
-    return {
-      success: false,
-      conflict: true,
-      reason: '所选时段教练有安排',
-      conflictType: 'coach',
-      suggestions,
-    };
-  }
-
-  let vehicle = null;
-  if (examType === 'subject2' || examType === 'subject3') {
-    if (vehicleId) {
-      vehicle = await Vehicle.findById(vehicleId);
-      if (!vehicle || vehicle.status !== 'available') {
-        throw new AppError('所选车辆不可用', 400);
-      }
-    } else {
-      const vehicles = await findAvailableVehicles(
-        student.licenseType,
-        examDate,
-        timeSlot
-      );
-      if (vehicles.length === 0) {
-        const suggestions = await suggestAlternativeSlots(
-          examType,
-          student.licenseType,
-          examDate
-        );
-        return {
-          success: false,
-          conflict: true,
-          reason: '所选时段无可用车辆',
-          conflictType: 'vehicle',
-          suggestions,
-        };
-      }
-      vehicle = vehicles[0];
+  if (examRoomId && coachId && (!needVehicle || vehicleId)) {
+    allocatedExamRoom = await ExamRoom.findById(examRoomId);
+    if (!allocatedExamRoom || allocatedExamRoom.status !== 'active') {
+      throw new AppError('考场不可用', 400);
     }
+    if (allocatedExamRoom.examType !== examType) {
+      throw new AppError('该考场不支持此考试类型', 400);
+    }
+
+    const examDayOfWeek = new Date(examDate).getDay();
+    if (!allocatedExamRoom.workDays.includes(examDayOfWeek)) {
+      throw new AppError('所选日期考场不开放', 400);
+    }
+
+    const capacity = await getExamRoomCapacity(examRoomId, examDate, timeSlot);
+    if (capacity.available <= 0) {
+      const suggestions = await suggestAlternativeSlots(
+        examType,
+        student.licenseType,
+        examDate
+      );
+      return {
+        success: false,
+        conflict: true,
+        reason: '所选时段考场已满',
+        suggestions,
+      };
+    }
+
+    allocatedCoach = await Coach.findById(coachId || student.assignedCoach);
+    if (!allocatedCoach || allocatedCoach.status !== 'active') {
+      throw new AppError('教练不可用', 400);
+    }
+    if (!allocatedCoach.licenseTypes.includes(student.licenseType)) {
+      throw new AppError('该教练不支持此驾照类型教学', 400);
+    }
+
+    const coachBusySlots = await getCoachAvailability(allocatedCoach._id, examDate);
+    const coachCheck = checkCoachAvailable(
+      coachBusySlots,
+      timeSlot.startTime,
+      timeSlot.endTime
+    );
+    if (!coachCheck.available) {
+      const suggestions = await suggestAlternativeSlots(
+        examType,
+        student.licenseType,
+        examDate
+      );
+      return {
+        success: false,
+        conflict: true,
+        reason: '所选时段教练有安排',
+        conflictType: 'coach',
+        suggestions,
+      };
+    }
+
+    if (needVehicle) {
+      if (vehicleId) {
+        const vehicleCheck = await isVehicleAvailableAtSlot(vehicleId, examDate, timeSlot);
+        if (!vehicleCheck.available) {
+          const suggestions = await suggestAlternativeSlots(
+            examType,
+            student.licenseType,
+            examDate
+          );
+          return {
+            success: false,
+            conflict: true,
+            reason: '所选时段车辆被占用',
+            conflictType: 'vehicle',
+            suggestions,
+          };
+        }
+        allocatedVehicle = await Vehicle.findById(vehicleId);
+      } else {
+        const vehicles = await findAvailableVehicles(
+          student.licenseType,
+          examDate,
+          timeSlot
+        );
+        if (vehicles.length === 0) {
+          const suggestions = await suggestAlternativeSlots(
+            examType,
+            student.licenseType,
+            examDate
+          );
+          return {
+            success: false,
+            conflict: true,
+            reason: '所选时段无可用车辆',
+            conflictType: 'vehicle',
+            suggestions,
+          };
+        }
+        allocatedVehicle = vehicles[0];
+      }
+    }
+  } else {
+    const allocation = await autoAllocateResources(
+      examType,
+      student.licenseType,
+      examDate,
+      timeSlot
+    );
+
+    if (!allocation.allocated) {
+      return {
+        success: false,
+        conflict: true,
+        reason: allocation.reason,
+        suggestions: allocation.suggestions || [],
+      };
+    }
+
+    allocatedExamRoom = allocation.examRoom;
+    allocatedCoach = allocation.coach;
+    allocatedVehicle = allocation.vehicle;
+    allocatedTimeSlot = allocation.timeSlot;
   }
 
   const booking = await ExamBooking.create({
     student: studentId,
     examType,
-    examRoom: examRoomId,
-    coach: coach._id,
-    vehicle: vehicle ? vehicle._id : null,
+    examRoom: allocatedExamRoom._id,
+    coach: allocatedCoach._id,
+    vehicle: allocatedVehicle ? allocatedVehicle._id : null,
     examDate,
-    timeSlot,
+    timeSlot: allocatedTimeSlot,
     status: 'confirmed',
   });
 
   await Schedule.create({
-    coach: coach._id,
+    coach: allocatedCoach._id,
     student: studentId,
-    vehicle: vehicle ? vehicle._id : null,
+    vehicle: allocatedVehicle ? allocatedVehicle._id : null,
     date: examDate,
-    startTime: timeSlot.startTime,
-    endTime: timeSlot.endTime,
+    startTime: allocatedTimeSlot.startTime,
+    endTime: allocatedTimeSlot.endTime,
     type: 'exam',
     status: 'scheduled',
     sourceBooking: booking._id,
   });
 
-  if (vehicle) {
-    vehicle.status = 'in_use';
-    await vehicle.save();
+  try {
+    await notifyStudent(
+      studentId,
+      'exam_booked',
+      '考试预约成功',
+      `您的${getExamTypeName(examType)}预约已成功。时间：${formatDate(examDate)} ${allocatedTimeSlot.startTime}-${allocatedTimeSlot.endTime}；考场：${allocatedExamRoom.name}；教练：${allocatedCoach.name}${allocatedVehicle ? `；车辆：${allocatedVehicle.plateNumber}` : ''}。`,
+      booking._id,
+      'ExamBooking'
+    );
+  } catch (err) {
+    console.error('发送学员预约通知失败:', err.message);
   }
 
-  await notifyStudent(
-    studentId,
-    'exam_booked',
-    '考试预约成功',
-    `您的${getExamTypeName(examType)}预约已成功，时间：${formatDate(examDate)} ${timeSlot.startTime}-${timeSlot.endTime}，考场：${examRoom.name}`,
-    booking._id,
-    'ExamBooking'
-  );
-
-  await notifyCoach(
-    coach._id,
-    'exam_booked',
-    '新考试预约',
-    `学员${student.name}预约了${formatDate(examDate)} ${timeSlot.startTime}-${timeSlot.endTime}的${getExamTypeName(examType)}考试。`,
-    booking._id,
-    'ExamBooking'
-  );
+  try {
+    await notifyCoach(
+      allocatedCoach._id,
+      'exam_booked',
+      '新考试预约',
+      `学员${student.name}预约了${formatDate(examDate)} ${allocatedTimeSlot.startTime}-${allocatedTimeSlot.endTime}的${getExamTypeName(examType)}考试${allocatedVehicle ? `，车辆：${allocatedVehicle.plateNumber}` : ''}。`,
+      booking._id,
+      'ExamBooking'
+    );
+  } catch (err) {
+    console.error('发送教练预约通知失败:', err.message);
+  }
 
   return {
     success: true,
     booking,
-    message: '预约成功',
+    allocated: {
+      examRoom: {
+        _id: allocatedExamRoom._id,
+        name: allocatedExamRoom.name,
+        address: allocatedExamRoom.address,
+      },
+      coach: {
+        _id: allocatedCoach._id,
+        name: allocatedCoach.name,
+        phone: allocatedCoach.phone,
+      },
+      vehicle: allocatedVehicle
+        ? {
+            _id: allocatedVehicle._id,
+            plateNumber: allocatedVehicle.plateNumber,
+            brand: allocatedVehicle.brand,
+          }
+        : null,
+      timeSlot: allocatedTimeSlot,
+    },
+    message: '预约成功，资源已自动分配',
   };
 };
 
@@ -413,29 +593,18 @@ const cancelBooking = async (bookingId, reason = '') => {
     await schedule.save();
   }
 
-  if (booking.vehicle) {
-    const vehicle = await Vehicle.findById(booking.vehicle);
-    if (vehicle) {
-      const hasOtherBookings = await ExamBooking.countDocuments({
-        vehicle: vehicle._id,
-        status: { $in: ['pending', 'confirmed', 'locked'] },
-        _id: { $ne: bookingId },
-      });
-      if (hasOtherBookings === 0) {
-        vehicle.status = 'available';
-        await vehicle.save();
-      }
-    }
+  try {
+    await notifyStudent(
+      booking.student,
+      'exam_cancelled',
+      '考试预约已取消',
+      `您的${getExamTypeName(booking.examType)}预约已取消${reason ? `，原因：${reason}` : ''}。`,
+      booking._id,
+      'ExamBooking'
+    );
+  } catch (err) {
+    console.error('发送取消通知失败:', err.message);
   }
-
-  await notifyStudent(
-    booking.student,
-    'exam_cancelled',
-    '考试预约已取消',
-    `您的${getExamTypeName(booking.examType)}预约已取消${reason ? `，原因：${reason}` : ''}。`,
-    booking._id,
-    'ExamBooking'
-  );
 
   return {
     success: true,
@@ -470,6 +639,7 @@ const getBookings = async (query = {}) => {
     status,
     startDate,
     endDate,
+    examRoomId,
   } = query;
 
   const filter = {};
@@ -477,6 +647,7 @@ const getBookings = async (query = {}) => {
   if (coachId) filter.coach = coachId;
   if (examType) filter.examType = examType;
   if (status) filter.status = status;
+  if (examRoomId) filter.examRoom = examRoomId;
   if (startDate || endDate) {
     filter.examDate = {};
     if (startDate) filter.examDate.$gte = new Date(startDate);
@@ -561,4 +732,6 @@ module.exports = {
   findAvailableCoaches,
   findAvailableVehicles,
   getExamTypeName,
+  autoAllocateResources,
+  isVehicleAvailableAtSlot,
 };

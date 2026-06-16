@@ -2,8 +2,11 @@ const reportService = require('../services/report.service');
 
 const getDailyReport = async (req, res, next) => {
   try {
-    const { date } = req.query;
-    const report = await reportService.generateDailyReport(date ? new Date(date) : new Date());
+    const { date, examRoomId } = req.query;
+    const report = await reportService.generateDailyReport(
+      date ? new Date(date) : new Date(),
+      examRoomId || null
+    );
     res.json({
       success: true,
       data: report,
@@ -15,7 +18,7 @@ const getDailyReport = async (req, res, next) => {
 
 const getDateRangeReport = async (req, res, next) => {
   try {
-    const { startDate, endDate } = req.query;
+    const { startDate, endDate, examRoomId } = req.query;
 
     if (!startDate || !endDate) {
       return res.status(400).json({
@@ -24,7 +27,7 @@ const getDateRangeReport = async (req, res, next) => {
       });
     }
 
-    const report = await reportService.generateDateRangeReport(startDate, endDate);
+    const report = await reportService.generateDateRangeReport(startDate, endDate, examRoomId || null);
     res.json({
       success: true,
       data: report,
@@ -36,7 +39,7 @@ const getDateRangeReport = async (req, res, next) => {
 
 const exportExcel = async (req, res, next) => {
   try {
-    const { startDate, endDate, type } = req.query;
+    const { startDate, endDate, type, examRoomId } = req.query;
 
     if (!startDate || !endDate) {
       return res.status(400).json({
@@ -45,9 +48,9 @@ const exportExcel = async (req, res, next) => {
       });
     }
 
-    const buffer = await reportService.exportReportToExcel(startDate, endDate, type || 'all');
-
-    const fileName = `运营报表_${startDate}_${endDate}.xlsx`;
+    const { buffer, fileName } = await reportService.exportReportToExcel(
+      startDate, endDate, type || 'all', examRoomId || null
+    );
 
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(fileName)}"`);
@@ -60,7 +63,7 @@ const exportExcel = async (req, res, next) => {
 
 const getVehicleUtilization = async (req, res, next) => {
   try {
-    const { startDate, endDate } = req.query;
+    const { startDate, endDate, examRoomId } = req.query;
 
     if (!startDate || !endDate) {
       return res.status(400).json({
@@ -69,7 +72,7 @@ const getVehicleUtilization = async (req, res, next) => {
       });
     }
 
-    const report = await reportService.getVehicleUtilizationReport(startDate, endDate);
+    const report = await reportService.getVehicleUtilizationReport(startDate, endDate, examRoomId || null);
     res.json({
       success: true,
       data: report,

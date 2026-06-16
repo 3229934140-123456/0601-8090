@@ -404,22 +404,105 @@ const approveShiftChange = async (requestId, approverId, replacementCoachId = nu
   }
 
   const newCoachId = replacementCoachId || schedule.coach;
+  const newDate = request.requestedSchedule.date;
+  const newStartTime = request.requestedSchedule.startTime;
+  const newEndTime = request.requestedSchedule.endTime;
 
-  if (replacementCoachId) {
-    const conflict = await checkScheduleConflict(
-      replacementCoachId,
-      request.requestedSchedule.date,
-      request.requestedSchedule.startTime,
-      request.requestedSchedule.endTime
-    );
-    if (conflict) {
-      throw new AppError('替换教练在新时段有排班冲突', 400);
+  const coachConflict = await checkScheduleConflict(
+    newCoachId,
+    newDate,
+    newStartTime,
+    newEndTime,
+    schedule._id
+  );
+
+  let conflictReason = null;
+
+  if (coachConflict) {
+    if (coachConflict.type === 'exam') {
+      const conflictBooking = coachConflict.booking;
+      conflictReason = `新时间与该教练的考试安排冲突：${formatDate(newDate)} ${conflictBooking.timeSlot.startTime}-${conflictBooking.timeSlot.endTime}（考试）`;
+    } else {
+      const conflictSchedule = coachConflict.schedule;
+      conflictReason = `新时间与该教练的排班冲突：${formatDate(newDate)} ${conflictSchedule.startTime}-${conflictSchedule.endTime}（${getScheduleTypeName(conflictSchedule.type)}）`;
+    }
+
+    throw new AppError(`审批驳回：${conflictReason}`, 400);
+  }
+
+  if (schedule.vehicle) {
+    const ExamBooking2 = require('../models/ExamBooking');
+    const startOfDay = new Date(newDate);
+    startOfDay.setHours(0, 0, 0, 0);
+    const endOfDay = new Date(newDate);
+    endOfDay.setHours(23, 59, 59, 999);
+
+    const vehicleBookings = await ExamBooking2.find({
+      vehicle: schedule.vehicle,
+      examDate: { $gte: startOfDay, $lte: endOfDay },
+      status: { $in: ['pending', 'confirmed', 'locked'] },
+    });
+
+    for (const vb of vehicleBookings) {
+      if (timeOverlap(newStartTime, newEndTime, vb.timeSlot.startTime, vb.timeSlot.endTime)) {
+        conflictReason = `新时间与车辆考试安排冲突：${formatDate(newDate)} ${vb.timeSlot.startTime}-${vb.timeSlot.endTime}（考试）`;
+        throw new AppError(`审批驳回：${conflictReason}`, 400);
+      }
+    }
+
+    const vehicleSchedules = await Schedule.find({
+      vehicle: schedule.vehicle,
+      date: { $gte: startOfDay, $lte: endOfDay },
+      status: { $in: ['scheduled', 'in_progress', 'changed'] },
+      _id: { $ne: schedule._id },
+    });
+
+    for (const vs of vehicleSchedules) {
+      if (timeOverlap(newStartTime, newEndTime, vs.startTime, vs.endTime)) {
+        conflictReason = `新时间与车辆排班冲突：${formatDate(newDate)} ${vs.startTime}-${vs.endTime}（${getScheduleTypeName(vs.type)}）`;
+        throw new AppError(`审批驳回：${conflictReason}`, 400);
+      }
     }
   }
 
-  schedule.date = request.requestedSchedule.date;
-  schedule.startTime = request.requestedSchedule.startTime;
-  schedule.endTime = request.requestedSchedule.endTime;
+  if (schedule.student) {
+    const ExamBooking3 = require('../models/ExamBooking');
+    const startOfDay = new Date(newDate);
+    startOfDay.setHours(0, 0, 0, 0);
+    const endOfDay = new Date(newDate);
+    endOfDay.setHours(23, 59, 59, 999);
+
+    const studentBookings = await ExamBooking3.find({
+      student: schedule.student,
+      examDate: { $gte: startOfDay, $lte: endOfDay },
+      status: { $in: ['pending', 'confirmed', 'locked'] },
+    });
+
+    for (const sb of studentBookings) {
+      if (timeOverlap(newStartTime, newEndTime, sb.timeSlot.startTime, sb.timeSlot.endTime)) {
+        conflictReason = `新时间与学员考试安排冲突：${formatDate(newDate)} ${sb.timeSlot.startTime}-${sb.timeSlot.endTime}（考试）`;
+        throw new AppError(`审批驳回：${conflictReason}`, 400);
+      }
+    }
+
+    const studentSchedules = await Schedule.find({
+      student: schedule.student,
+      date: { $gte: startOfDay, $lte: endOfDay },
+      status: { $in: ['scheduled', 'in_progress', 'changed'] },
+      _id: { $ne: schedule._id },
+    });
+
+    for (const ss of studentSchedules) {
+      if (timeOverlap(newStartTime, newEndTime, ss.startTime, ss.endTime)) {
+        conflictReason = `新时间与学员其他排班冲突：${formatDate(newDate)} ${ss.startTime}-${ss.endTime}（${getScheduleTypeName(ss.type)}）`;
+        throw new AppError(`审批驳回：${conflictReason}`, 400);
+      }
+    }
+  }
+
+  schedule.date = newDate;
+  schedule.startTime = newStartTime;
+  schedule.endTime = newEndTime;
   schedule.coach = newCoachId;
   schedule.status = 'changed';
   await schedule.save();
@@ -430,35 +513,47 @@ const approveShiftChange = async (requestId, approverId, replacementCoachId = nu
   request.replacementCoach = replacementCoachId || null;
   await request.save();
 
-  await notifyCoach(
-    request.coach,
-    'shift_approved',
-    '调班申请已通过',
-    `您的调班申请已通过。新排班：${formatDate(request.requestedSchedule.date)} ${request.requestedSchedule.startTime}-${request.requestedSchedule.endTime}`,
-    request._id,
-    'ShiftChangeRequest'
-  );
+  try {
+    await notifyCoach(
+      request.coach,
+      'shift_approved',
+      '调班申请已通过',
+      `您的调班申请已通过。新排班：${formatDate(newDate)} ${newStartTime}-${newEndTime}${replacementCoachId ? '，教练已更换' : ''}`,
+      request._id,
+      'ShiftChangeRequest'
+    );
+  } catch (err) {
+    console.error('发送调班通过通知失败:', err.message);
+  }
 
   if (replacementCoachId) {
-    await notifyCoach(
-      replacementCoachId,
-      'schedule_created',
-    '您有新的排班安排',
-      `您有新的排班安排：${formatDate(request.requestedSchedule.date)} ${request.requestedSchedule.startTime}-${request.requestedSchedule.endTime}`,
-      schedule._id,
-      'Schedule'
-    );
+    try {
+      await notifyCoach(
+        replacementCoachId,
+        'schedule_created',
+        '您有新的排班安排',
+        `您有新的排班安排：${formatDate(newDate)} ${newStartTime}-${newEndTime}（${getScheduleTypeName(schedule.type)}）`,
+        schedule._id,
+        'Schedule'
+      );
+    } catch (err) {
+      console.error('发送新教练通知失败:', err.message);
+    }
   }
 
   if (schedule.student) {
-    await notifyStudent(
-      schedule.student,
-      'schedule_changed',
-      '学习安排有变更',
-      `您的学习安排已变更为：${formatDate(request.requestedSchedule.date)} ${request.requestedSchedule.startTime}-${request.requestedSchedule.endTime}`,
-      schedule._id,
-      'Schedule'
-    );
+    try {
+      await notifyStudent(
+        schedule.student,
+        'schedule_changed',
+        '学习安排有变更',
+        `您的学习安排已变更为：${formatDate(newDate)} ${newStartTime}-${newEndTime}${replacementCoachId ? '，教练已更换' : ''}`,
+        schedule._id,
+        'Schedule'
+      );
+    } catch (err) {
+      console.error('发送学员变更通知失败:', err.message);
+    }
   }
 
   return { request, schedule };

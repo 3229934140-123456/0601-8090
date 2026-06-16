@@ -2,7 +2,7 @@ const Student = require('../models/Student');
 const Coach = require('../models/Coach');
 const { AppError } = require('../middleware/errorHandler');
 const { isDateExpired, isValidIdCard } = require('../utils/dateUtils');
-const { notifyStudent, notifyOperator } = require('./notification.service');
+const { notifyStudent, notifyCoach, notifyOperator } = require('./notification.service');
 
 const enrollStudent = async (studentData) => {
   const {
@@ -100,6 +100,13 @@ const verifyHealthReport = async (studentId, result) => {
   }
 
   if (student.status !== 'pending_review') {
+    if (student.status === 'approved') {
+      return {
+        success: true,
+        student,
+        message: '该学员已审核通过',
+      };
+    }
     throw new AppError('该学员状态不允许审核', 400);
   }
 
@@ -111,14 +118,18 @@ const verifyHealthReport = async (studentId, result) => {
     student.rejectReason = `体检报告不合格：${remark || '不符合报考条件'}`;
     await student.save();
 
-    await notifyStudent(
-      student._id,
-      'enrollment_rejected',
-      '报名未通过',
-      `您的报名未通过，原因：${student.rejectReason}`,
-      student._id,
-      'Student'
-    );
+    try {
+      await notifyStudent(
+        student._id,
+        'enrollment_rejected',
+        '报名未通过',
+        `您的报名未通过，原因：${student.rejectReason}`,
+        student._id,
+        'Student'
+      );
+    } catch (notifyErr) {
+      console.error('发送学员驳回通知失败:', notifyErr.message);
+    }
 
     return {
       success: false,
@@ -134,14 +145,18 @@ const verifyHealthReport = async (studentId, result) => {
     student.healthReport.checkDate = new Date();
     await student.save();
 
-    await notifyStudent(
-      student._id,
-      'enrollment_rejected',
-      '报名未通过',
-      '您的报名未通过，原因：身份证已过期，请更新有效身份证件后重新报名。',
-      student._id,
-      'Student'
-    );
+    try {
+      await notifyStudent(
+        student._id,
+        'enrollment_rejected',
+        '报名未通过',
+        '您的报名未通过，原因：身份证已过期，请更新有效身份证件后重新报名。',
+        student._id,
+        'Student'
+      );
+    } catch (notifyErr) {
+      console.error('发送学员身份证驳回通知失败:', notifyErr.message);
+    }
 
     return {
       success: false,
@@ -150,42 +165,110 @@ const verifyHealthReport = async (studentId, result) => {
     };
   }
 
-  const availableCoach = await Coach.findOne({
-    status: 'active',
-    licenseTypes: student.licenseType,
-  }).sort({ createdAt: 1 });
+  let assignedCoach = null;
+
+  if (student.assignedCoach) {
+    assignedCoach = await Coach.findById(student.assignedCoach);
+    if (assignedCoach && assignedCoach.status !== 'active') {
+      assignedCoach = null;
+    }
+  }
+
+  if (!assignedCoach) {
+    const Student2 = require('../models/Student');
+    const coachesWithCounts = await Coach.aggregate([
+      {
+        $match: {
+          status: 'active',
+          licenseTypes: student.licenseType,
+        },
+      },
+      {
+        $lookup: {
+          from: Student2.collection.name,
+          localField: '_id',
+          foreignField: 'assignedCoach',
+          as: 'students',
+        },
+      },
+      {
+        $addFields: {
+          studentCount: { $size: '$students' },
+        },
+      },
+      {
+        $sort: {
+          studentCount: 1,
+          createdAt: 1,
+        },
+      },
+      {
+        $limit: 1,
+      },
+    ]);
+
+    if (coachesWithCounts.length > 0) {
+      assignedCoach = coachesWithCounts[0];
+    }
+  }
+
+  if (!assignedCoach) {
+    assignedCoach = await Coach.findOne({
+      status: 'active',
+    }).sort({ createdAt: 1 });
+  }
 
   student.healthReport.status = 'approved';
   student.healthReport.checkDate = new Date();
   student.status = 'approved';
-  student.assignedCoach = availableCoach ? availableCoach._id : null;
+  student.assignedCoach = assignedCoach ? assignedCoach._id : null;
 
   await student.save();
 
-  await notifyStudent(
-    student._id,
-    'enrollment_approved',
-    '报名审核通过',
-    '恭喜！您的报名已通过审核，可以开始学习了。',
-    student._id,
-    'Student'
-  );
+  const populatedStudent = await Student.findById(student._id)
+    .populate('assignedCoach', 'name phone');
 
-  if (availableCoach) {
-    await notifyCoach(
-      availableCoach._id,
+  try {
+    await notifyStudent(
+      student._id,
       'enrollment_approved',
-      '新学员分配',
-      `新学员 ${student.name} 已分配给您，请做好教学准备。`,
+      '报名审核通过',
+      assignedCoach
+        ? `恭喜！您的报名已通过审核，分配教练：${assignedCoach.name}，可以开始学习了。`
+        : '恭喜！您的报名已通过审核，稍后将为您分配教练。',
       student._id,
       'Student'
     );
+  } catch (notifyErr) {
+    console.error('发送学员审核通过通知失败:', notifyErr.message);
+  }
+
+  if (assignedCoach) {
+    try {
+      await notifyCoach(
+        assignedCoach._id,
+        'enrollment_approved',
+        '新学员分配',
+        `新学员 ${student.name}（${student.licenseType}）已分配给您，请做好教学准备。`,
+        student._id,
+        'Student'
+      );
+    } catch (notifyErr) {
+      console.error('发送教练分配通知失败:', notifyErr.message);
+    }
   }
 
   return {
     success: true,
-    student,
-    message: '审核通过，学员已激活',
+    student: populatedStudent,
+    assignedCoach: assignedCoach
+      ? {
+          _id: assignedCoach._id,
+          name: assignedCoach.name,
+          phone: assignedCoach.phone,
+        }
+      : null,
+    message: assignedCoach ? '审核通过，已分配教练' : '审核通过，暂无可用教练，将稍后分配',
   };
 };
 

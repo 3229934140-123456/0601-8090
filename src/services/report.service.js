@@ -3,14 +3,20 @@ const ExamBooking = require('../models/ExamBooking');
 const Vehicle = require('../models/Vehicle');
 const Schedule = require('../models/Schedule');
 const ExamRoom = require('../models/ExamRoom');
+const DrivingLicense = require('../models/DrivingLicense');
 const ExcelJS = require('exceljs');
 const { formatDate, getDatesBetween } = require('../utils/dateUtils');
 
-const generateDailyReport = async (date = new Date()) => {
+const generateDailyReport = async (date = new Date(), examRoomId = null) => {
   const startOfDay = new Date(date);
   startOfDay.setHours(0, 0, 0, 0);
   const endOfDay = new Date(date);
   endOfDay.setHours(23, 59, 59, 999);
+
+  const examRoomFilter = examRoomId ? { examRoom: examRoomId } : {};
+
+  const examRoom = examRoomId ? await ExamRoom.findById(examRoomId) : null;
+  const examRoomName = examRoom ? examRoom.name : '全部场地';
 
   const enrollmentCount = await Student.countDocuments({
     createdAt: { $gte: startOfDay, $lte: endOfDay },
@@ -26,50 +32,102 @@ const generateDailyReport = async (date = new Date()) => {
     updatedAt: { $gte: startOfDay, $lte: endOfDay },
   });
 
-  const examBookings = await ExamBooking.countDocuments({
+  const examQuery = {
     examDate: { $gte: startOfDay, $lte: endOfDay },
-  });
+    ...examRoomFilter,
+  };
 
-  const completedExams = await ExamBooking.find({
-    examDate: { $gte: startOfDay, $lte: endOfDay },
+  const examBookings = await ExamBooking.countDocuments(examQuery);
+
+  const completedExamQuery = {
+    ...examQuery,
     status: 'completed',
-  });
+  };
+
+  const completedExams = await ExamBooking.find(completedExamQuery);
 
   const passedExams = completedExams.filter((e) => e.result && e.result.passed).length;
   const failedExams = completedExams.filter((e) => e.result && !e.result.passed).length;
   const passRate = completedExams.length > 0 ? (passedExams / completedExams.length * 100).toFixed(2) : 0;
 
-  const totalVehicles = await Vehicle.countDocuments({ status: { $ne: 'disabled' } });
-  const inUseVehicles = await Vehicle.countDocuments({ status: 'in_use' });
-  const maintenanceVehicles = await Vehicle.countDocuments({
-    status: { $in: ['maintenance', 'repairing'] },
-  });
+  const vehicleIdsFromBookings = [];
+  if (examRoomId) {
+    const relatedBookings = await ExamBooking.find(examQuery);
+    relatedBookings.forEach((b) => {
+      if (b.vehicle) vehicleIdsFromBookings.push(b.vehicle.toString());
+    });
+  }
+
+  const vehicleFilter = examRoomId
+    ? { _id: { $in: [...new Set(vehicleIdsFromBookings)] } }
+    : { status: { $ne: 'disabled' } };
+
+  const totalVehicles = examRoomId
+    ? vehicleIdsFromBookings.length > 0 ? await Vehicle.countDocuments(vehicleFilter) : 0
+    : await Vehicle.countDocuments({ status: { $ne: 'disabled' } });
+
+  let inUseVehicles = 0;
+  let maintenanceVehicles = 0;
+
+  if (totalVehicles > 0) {
+    if (examRoomId) {
+      const inUseBookingIds = await ExamBooking.find({
+        ...examQuery,
+        status: { $in: ['pending', 'confirmed', 'locked'] },
+      }).distinct('vehicle');
+      inUseVehicles = inUseBookingIds.filter((v) => v).length;
+
+      const vehiclesInList = await Vehicle.find(vehicleFilter);
+      maintenanceVehicles = vehiclesInList.filter((v) =>
+        ['maintenance', 'repairing'].includes(v.status)
+      ).length;
+    } else {
+      inUseVehicles = await Vehicle.countDocuments({ status: 'in_use' });
+      maintenanceVehicles = await Vehicle.countDocuments({
+        status: { $in: ['maintenance', 'repairing'] },
+      });
+    }
+  }
+
   const vehicleUtilization = totalVehicles > 0 ? (inUseVehicles / totalVehicles * 100).toFixed(2) : 0;
 
-  const scheduleCount = await Schedule.countDocuments({
-    date: { $gte: startOfDay, $lte: endOfDay },
-    status: { $ne: 'cancelled' },
-  });
+  const scheduleFilter = examRoomId
+    ? {
+        date: { $gte: startOfDay, $lte: endOfDay },
+        status: { $ne: 'cancelled' },
+      }
+    : {
+        date: { $gte: startOfDay, $lte: endOfDay },
+        status: { $ne: 'cancelled' },
+      };
 
-  const completedSchedules = await Schedule.countDocuments({
-    date: { $gte: startOfDay, $lte: endOfDay },
-    status: 'completed',
-  });
+  const scheduleCount = await Schedule.countDocuments(scheduleFilter);
 
-  const noShowCount = await ExamBooking.countDocuments({
-    examDate: { $gte: startOfDay, $lte: endOfDay },
+  const completedScheduleFilter = examRoomId
+    ? { ...scheduleFilter, status: 'completed' }
+    : { ...scheduleFilter, status: 'completed' };
+
+  const completedSchedules = await Schedule.countDocuments(completedScheduleFilter);
+
+  const noShowQuery = {
+    ...examQuery,
     status: 'no_show',
-  });
+  };
+  const noShowCount = await ExamBooking.countDocuments(noShowQuery);
 
-  const lateCount = await ExamBooking.countDocuments({
-    examDate: { $gte: startOfDay, $lte: endOfDay },
+  const lateQuery = {
+    ...examQuery,
     status: 'late',
-  });
+  };
+  const lateCount = await ExamBooking.countDocuments(lateQuery);
 
-  const examRooms = await ExamRoom.find({ status: 'active' });
+  const examRooms = examRoomId
+    ? [examRoom]
+    : await ExamRoom.find({ status: 'active' });
+
   const examRoomStats = [];
-
   for (const room of examRooms) {
+    if (!room) continue;
     const roomBookings = await ExamBooking.countDocuments({
       examRoom: room._id,
       examDate: { $gte: startOfDay, $lte: endOfDay },
@@ -86,8 +144,15 @@ const generateDailyReport = async (date = new Date()) => {
     });
   }
 
+  const newLicenseCount = examRoomId
+    ? 0
+    : await DrivingLicense.countDocuments({
+        createdAt: { $gte: startOfDay, $lte: endOfDay },
+      });
+
   return {
     date: formatDate(date),
+    filterExamRoom: examRoomId ? { id: examRoomId, name: examRoomName } : null,
     enrollment: {
       total: enrollmentCount,
       approved: approvedCount,
@@ -101,6 +166,7 @@ const generateDailyReport = async (date = new Date()) => {
       passRate: parseFloat(passRate),
       noShow: noShowCount,
       late: lateCount,
+      newLicenses: newLicenseCount,
     },
     vehicles: {
       total: totalVehicles,
@@ -118,22 +184,26 @@ const generateDailyReport = async (date = new Date()) => {
   };
 };
 
-const generateDateRangeReport = async (startDate, endDate) => {
+const generateDateRangeReport = async (startDate, endDate, examRoomId = null) => {
   const start = new Date(startDate);
   const end = new Date(endDate);
   end.setHours(23, 59, 59, 999);
+
+  const examRoom = examRoomId ? await ExamRoom.findById(examRoomId) : null;
+  const examRoomName = examRoom ? examRoom.name : '全部场地';
 
   const dates = getDatesBetween(start, end);
   const dailyReports = [];
 
   for (const date of dates) {
-    const report = await generateDailyReport(date);
+    const report = await generateDailyReport(date, examRoomId);
     dailyReports.push(report);
   }
 
   const summary = {
     startDate: formatDate(start),
     endDate: formatDate(end),
+    filterExamRoom: examRoomId ? { id: examRoomId, name: examRoomName } : null,
     totalDays: dates.length,
     totalEnrollment: dailyReports.reduce((sum, r) => sum + r.enrollment.total, 0),
     totalApproved: dailyReports.reduce((sum, r) => sum + r.enrollment.approved, 0),
@@ -150,9 +220,10 @@ const generateDateRangeReport = async (startDate, endDate) => {
       : 0,
     totalNoShow: dailyReports.reduce((sum, r) => sum + r.exams.noShow, 0),
     totalLate: dailyReports.reduce((sum, r) => sum + r.exams.late, 0),
+    totalNewLicenses: dailyReports.reduce((sum, r) => sum + (r.exams.newLicenses || 0), 0),
   };
 
-  const examTypeStats = await getExamTypeStats(start, end);
+  const examTypeStats = await getExamTypeStats(start, end, examRoomId);
   const licenseTypeStats = await getLicenseTypeStats(start, end);
 
   return {
@@ -163,14 +234,18 @@ const generateDateRangeReport = async (startDate, endDate) => {
   };
 };
 
-const getExamTypeStats = async (startDate, endDate) => {
+const getExamTypeStats = async (startDate, endDate, examRoomId = null) => {
+  const matchCondition = {
+    examDate: { $gte: startDate, $lte: endDate },
+    status: 'completed',
+  };
+  if (examRoomId) {
+    matchCondition.examRoom = new mongoose.Types.ObjectId(examRoomId);
+  }
+
+  const mongoose = require('mongoose');
   const stats = await ExamBooking.aggregate([
-    {
-      $match: {
-        examDate: { $gte: startDate, $lte: endDate },
-        status: 'completed',
-      },
-    },
+    { $match: matchCondition },
     {
       $group: {
         _id: '$examType',
@@ -227,8 +302,11 @@ const getLicenseTypeStats = async (startDate, endDate) => {
   return stats;
 };
 
-const exportReportToExcel = async (startDate, endDate, type = 'summary') => {
-  const report = await generateDateRangeReport(startDate, endDate);
+const exportReportToExcel = async (startDate, endDate, type = 'all', examRoomId = null) => {
+  const report = await generateDateRangeReport(startDate, endDate, examRoomId);
+  const examRoom = examRoomId ? await ExamRoom.findById(examRoomId) : null;
+  const filterLabel = examRoom ? `_${examRoom.name}` : '';
+
   const workbook = new ExcelJS.Workbook();
   workbook.creator = '驾校管理系统';
   workbook.created = new Date();
@@ -237,15 +315,16 @@ const exportReportToExcel = async (startDate, endDate, type = 'summary') => {
     const summarySheet = workbook.addWorksheet('汇总报表');
 
     summarySheet.columns = [
-      { header: '指标', key: 'metric', width: 25 },
-      { header: '数值', key: 'value', width: 20 },
+      { header: '指标', key: 'metric', width: 30 },
+      { header: '数值', key: 'value', width: 22 },
     ];
 
     const { summary } = report;
-    summarySheet.addRows([
+    const rows = [
       { metric: '统计起始日期', value: summary.startDate },
       { metric: '统计结束日期', value: summary.endDate },
       { metric: '统计天数', value: summary.totalDays },
+      { metric: '筛选场地', value: summary.filterExamRoom ? summary.filterExamRoom.name : '全部场地' },
       { metric: '', value: '' },
       { metric: '【报名统计】', value: '' },
       { metric: '总报名人数', value: summary.totalEnrollment },
@@ -260,10 +339,13 @@ const exportReportToExcel = async (startDate, endDate, type = 'summary') => {
       { metric: '平均通过率(%)', value: summary.averagePassRate },
       { metric: '缺考人数', value: summary.totalNoShow },
       { metric: '迟到人数', value: summary.totalLate },
+      { metric: '新发证数量', value: summary.totalNewLicenses },
       { metric: '', value: '' },
       { metric: '【车辆统计】', value: '' },
       { metric: '平均车辆利用率(%)', value: summary.averageVehicleUtilization },
-    ]);
+    ];
+
+    rows.forEach((r) => summarySheet.addRow(r));
 
     summarySheet.getRow(1).font = { bold: true, size: 12 };
     summarySheet.getRow(1).fill = {
@@ -271,6 +353,13 @@ const exportReportToExcel = async (startDate, endDate, type = 'summary') => {
       pattern: 'solid',
       fgColor: { argb: 'FFE0E0E0' },
     };
+
+    ['【报名统计】', '【考试统计】', '【车辆统计】'].forEach((label, idx) => {
+      const rowIdx = rows.findIndex((r) => r.metric === label) + 1;
+      if (rowIdx > 0) {
+        summarySheet.getRow(rowIdx).font = { bold: true, size: 11, color: { argb: 'FF1F4E79' } };
+      }
+    });
   }
 
   if (type === 'daily' || type === 'all') {
@@ -284,6 +373,7 @@ const exportReportToExcel = async (startDate, endDate, type = 'summary') => {
       { header: '完成考试数', key: 'completedExams', width: 12 },
       { header: '通过数', key: 'passed', width: 8 },
       { header: '通过率(%)', key: 'passRate', width: 10 },
+      { header: '新发证数', key: 'newLicenses', width: 10 },
       { header: '车辆利用率(%)', key: 'vehicleUtil', width: 14 },
       { header: '缺考数', key: 'noShow', width: 8 },
       { header: '迟到数', key: 'late', width: 8 },
@@ -298,6 +388,7 @@ const exportReportToExcel = async (startDate, endDate, type = 'summary') => {
         completedExams: r.exams.completed,
         passed: r.exams.passed,
         passRate: r.exams.passRate,
+        newLicenses: r.exams.newLicenses || 0,
         vehicleUtil: r.vehicles.utilizationRate,
         noShow: r.exams.noShow,
         late: r.exams.late,
@@ -340,18 +431,23 @@ const exportReportToExcel = async (startDate, endDate, type = 'summary') => {
   if (type === 'enrollment' || type === 'all') {
     const enrollmentSheet = workbook.addWorksheet('报名明细');
 
-    const students = await Student.find({
+    const studentQuery = {
       createdAt: {
         $gte: new Date(startDate),
         $lte: new Date(endDate),
       },
-    }).sort({ createdAt: -1 });
+    };
+
+    const students = await Student.find(studentQuery)
+      .populate('assignedCoach', 'name')
+      .sort({ createdAt: -1 });
 
     enrollmentSheet.columns = [
       { header: '姓名', key: 'name', width: 12 },
       { header: '身份证号', key: 'idCard', width: 20 },
       { header: '联系电话', key: 'phone', width: 14 },
       { header: '驾照类型', key: 'licenseType', width: 10 },
+      { header: '分配教练', key: 'coachName', width: 12 },
       { header: '状态', key: 'status', width: 12 },
       { header: '报名日期', key: 'enrollmentDate', width: 12 },
     ];
@@ -362,6 +458,7 @@ const exportReportToExcel = async (startDate, endDate, type = 'summary') => {
         idCard: s.idCard,
         phone: s.phone,
         licenseType: s.licenseType,
+        coachName: s.assignedCoach ? s.assignedCoach.name : '未分配',
         status: getStudentStatusName(s.status),
         enrollmentDate: formatDate(s.enrollmentDate),
       });
@@ -375,8 +472,67 @@ const exportReportToExcel = async (startDate, endDate, type = 'summary') => {
     };
   }
 
+  if (type === 'examDetail' || type === 'all') {
+    const examDetailSheet = workbook.addWorksheet('考试明细');
+
+    const mongoose = require('mongoose');
+    const examDetailQuery = {
+      examDate: {
+        $gte: new Date(startDate),
+        $lte: new Date(endDate),
+      },
+    };
+    if (examRoomId) {
+      examDetailQuery.examRoom = new mongoose.Types.ObjectId(examRoomId);
+    }
+
+    const examBookings = await ExamBooking.find(examDetailQuery)
+      .populate('student', 'name licenseType')
+      .populate('examRoom', 'name')
+      .populate('coach', 'name')
+      .populate('vehicle', 'plateNumber')
+      .sort({ examDate: -1, 'timeSlot.startTime': 1 });
+
+    examDetailSheet.columns = [
+      { header: '考试日期', key: 'examDate', width: 12 },
+      { header: '时段', key: 'timeSlot', width: 14 },
+      { header: '考场', key: 'examRoom', width: 14 },
+      { header: '科目', key: 'examType', width: 10 },
+      { header: '学员姓名', key: 'studentName', width: 12 },
+      { header: '驾照类型', key: 'licenseType', width: 10 },
+      { header: '教练', key: 'coachName', width: 12 },
+      { header: '车辆', key: 'plateNumber', width: 12 },
+      { header: '状态', key: 'status', width: 10 },
+      { header: '分数', key: 'score', width: 8 },
+      { header: '是否通过', key: 'passed', width: 10 },
+    ];
+
+    examBookings.forEach((b) => {
+      examDetailSheet.addRow({
+        examDate: formatDate(b.examDate),
+        timeSlot: `${b.timeSlot.startTime}-${b.timeSlot.endTime}`,
+        examRoom: b.examRoom ? b.examRoom.name : '',
+        examType: getExamTypeName(b.examType),
+        studentName: b.student ? b.student.name : '',
+        licenseType: b.student ? b.student.licenseType : '',
+        coachName: b.coach ? b.coach.name : '',
+        plateNumber: b.vehicle ? b.vehicle.plateNumber : '',
+        status: getExamStatusName(b.status),
+        score: b.result ? b.result.score : '',
+        passed: b.result ? (b.result.passed ? '是' : '否') : '',
+      });
+    });
+
+    examDetailSheet.getRow(1).font = { bold: true, size: 11 };
+    examDetailSheet.getRow(1).fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFE0E0E0' },
+    };
+  }
+
   const buffer = await workbook.xlsx.writeBuffer();
-  return buffer;
+  return { buffer, fileName: `运营报表${filterLabel}_${formatDate(startDate)}_至${formatDate(endDate)}.xlsx` };
 };
 
 const getStudentStatusName = (status) => {
@@ -392,25 +548,98 @@ const getStudentStatusName = (status) => {
   return names[status] || status;
 };
 
-const getVehicleUtilizationReport = async (startDate, endDate) => {
-  const vehicles = await Vehicle.find({ status: { $ne: 'disabled' } });
+const getExamStatusName = (status) => {
+  const names = {
+    pending: '待确认',
+    confirmed: '已确认',
+    locked: '已锁定',
+    cancelled: '已取消',
+    completed: '已完成',
+    no_show: '缺考',
+    late: '迟到',
+  };
+  return names[status] || status;
+};
+
+const getVehicleUtilizationReport = async (startDate, endDate, examRoomId = null) => {
+  let vehicleFilter = { status: { $ne: 'disabled' } };
+
+  if (examRoomId) {
+    const mongoose = require('mongoose');
+    const relatedVehicleIds = await ExamBooking.aggregate([
+      {
+        $match: {
+          examRoom: new mongoose.Types.ObjectId(examRoomId),
+          examDate: {
+            $gte: new Date(startDate),
+            $lte: new Date(endDate),
+          },
+          vehicle: { $exists: true, $ne: null },
+        },
+      },
+      { $group: { _id: '$vehicle' } },
+    ]);
+    const ids = relatedVehicleIds.map((v) => v._id);
+    vehicleFilter = { _id: { $in: ids } };
+  }
+
+  const vehicles = await Vehicle.find(vehicleFilter);
   const result = [];
 
   for (const vehicle of vehicles) {
-    const schedules = await Schedule.find({
-      vehicle: vehicle._id,
-      date: {
-        $gte: new Date(startDate),
-        $lte: new Date(endDate),
-      },
+    const examQuery = examRoomId
+      ? {
+          vehicle: vehicle._id,
+          examRoom: examRoomId,
+          examDate: {
+            $gte: new Date(startDate),
+            $lte: new Date(endDate),
+          },
+        }
+      : {
+          vehicle: vehicle._id,
+          examDate: {
+            $gte: new Date(startDate),
+            $lte: new Date(endDate),
+          },
+        };
+
+    const bookings = await ExamBooking.find({
+      ...examQuery,
       status: { $ne: 'cancelled' },
     });
 
-    const totalHours = schedules.reduce((sum, s) => {
-      const [sh, sm] = s.startTime.split(':').map(Number);
-      const [eh, em] = s.endTime.split(':').map(Number);
-      return sum + (eh * 60 + em - sh * 60 - sm) / 60;
-    }, 0);
+    const scheduleQuery = examRoomId
+      ? {
+          vehicle: vehicle._id,
+          date: {
+            $gte: new Date(startDate),
+            $lte: new Date(endDate),
+          },
+        }
+      : {
+          vehicle: vehicle._id,
+          date: {
+            $gte: new Date(startDate),
+            $lte: new Date(endDate),
+          },
+        };
+
+    const schedules = await Schedule.find({
+      ...scheduleQuery,
+      status: { $ne: 'cancelled' },
+    });
+
+    let totalHours = 0;
+    [...bookings, ...schedules].forEach((item) => {
+      const startTime = item.timeSlot ? item.timeSlot.startTime : item.startTime;
+      const endTime = item.timeSlot ? item.timeSlot.endTime : item.endTime;
+      if (startTime && endTime) {
+        const [sh, sm] = startTime.split(':').map(Number);
+        const [eh, em] = endTime.split(':').map(Number);
+        totalHours += (eh * 60 + em - sh * 60 - sm) / 60;
+      }
+    });
 
     const dates = getDatesBetween(startDate, endDate);
     const maxHours = dates.length * 8;
@@ -426,6 +655,7 @@ const getVehicleUtilizationReport = async (startDate, endDate) => {
       totalUsageHours: totalHours.toFixed(1),
       utilizationRate: parseFloat(utilization),
       scheduleCount: schedules.length,
+      examCount: bookings.length,
     });
   }
 
@@ -437,5 +667,5 @@ module.exports = {
   generateDateRangeReport,
   exportReportToExcel,
   getVehicleUtilizationReport,
-  getExamTypeStats: getExamTypeStats,
+  getExamTypeStats,
 };
